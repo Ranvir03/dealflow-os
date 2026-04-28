@@ -257,7 +257,21 @@ elif page == "Deal Workspace":
     st.subheader("Decision")
 
 df_current = load_data()
-deal = df_current[df_current["id"] == deal_id].iloc[0]
+deal_id = st.session_state.get("deal_id")
+
+if deal_id is None:
+    st.warning("No deal selected. Please open a deal from Pipeline or Dashboard.")
+    st.stop()
+
+df_current = load_data()
+
+deal_row = df_current[df_current["id"] == deal_id]
+
+if deal_row.empty:
+    st.warning("Deal not found in database.")
+    st.stop()
+
+deal = deal_row.iloc[0]
 
 current = deal["decision"] if deal["decision"] else "Pending"
 
