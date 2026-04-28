@@ -398,26 +398,27 @@ elif page == "Deal Workspace":
     # =================================================
     st.subheader("⚖️ Decision")
 
-    decision = st.radio("Decision", ["Pending","Approve","Reject","Hold"])
-    reason = st.text_area("Rationale")
+decision = st.radio("Decision", ["Pending","Approve","Reject","Hold"])
+reason = st.text_area("Rationale")
 
-    if st.button("Save Decision"):
+if st.button("Save Decision"):
 
-        c.execute("""
-        UPDATE deals
-        SET decision=?, decision_reason=?, decision_date=?
-        WHERE id=?
-        """, (
-            decision,
-            reason,
-            str(datetime.date.today()),
-            deal["id"]
-        ))
+    clean_decision = decision.strip().capitalize()
 
-        conn.commit()
-        st.success("Saved")
-        st.rerun()
+    c.execute("""
+    UPDATE deals
+    SET decision=?, decision_reason=?, decision_date=?
+    WHERE id=?
+    """, (
+        clean_decision,
+        reason,
+        str(datetime.date.today()),
+        deal["id"]
+    ))
 
+    conn.commit()
+    st.success(f"Saved: {clean_decision}")
+    st.rerun()
     st.divider()
 
     # =================================================
@@ -464,8 +465,12 @@ elif page == "Decision Center":
 
     st.header("Decision Center")
 
-    st.metric("Approved", len(df_raw[df_raw["decision"] == "Approve"]))
-    st.metric("Rejected", len(df_raw[df_raw["decision"] == "Reject"]))
-    st.metric("Hold", len(df_raw[df_raw["decision"] == "Hold"]))
+    df_live = load()
 
-    st.dataframe(df_raw)
+    df_live["decision"] = df_live["decision"].fillna("").str.strip().str.capitalize()
+
+    st.metric("Approved", len(df_live[df_live["decision"] == "Approve"]))
+    st.metric("Rejected", len(df_live[df_live["decision"] == "Reject"]))
+    st.metric("Hold", len(df_live[df_live["decision"] == "Hold"]))
+
+    st.dataframe(df_live)
