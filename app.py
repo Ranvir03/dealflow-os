@@ -135,10 +135,13 @@ if page == "Dashboard":
 
     st.header("Dashboard")
 
+    df = load_data()  # 🔥 CRITICAL FIX: refresh every time
+
     if df.empty:
         st.info("No deals yet.")
     else:
-        for _, r in load_data().iterrows():
+        for _, r in df.iterrows():
+
             col1, col2 = st.columns([5,1])
 
             with col1:
