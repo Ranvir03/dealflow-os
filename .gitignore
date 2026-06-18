@@ -1,0 +1,9 @@
+# Local database (runtime data, not source)
+deals.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/

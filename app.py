@@ -383,7 +383,7 @@ elif page == "Deal Workspace":
 
             c.execute(
                 "UPDATE deals SET stage=? WHERE id=?",
-                (new_stage, deal["id"])
+                (new_stage, int(deal["id"]))
             )
             conn.commit()
 
@@ -427,7 +427,7 @@ elif page == "Deal Workspace":
             clean_decision,
             reason,
             str(datetime.date.today()),
-            deal["id"]
+            int(deal["id"])
         ))
 
         conn.commit()
@@ -478,7 +478,7 @@ elif page == "Deal Workspace":
 
                 c.execute(
                     "DELETE FROM deals WHERE id=?",
-                    (deal["id"],)
+                    (int(deal["id"]),)
                 )
                 conn.commit()
 
