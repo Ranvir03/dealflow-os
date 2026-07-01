@@ -15,7 +15,7 @@ st.set_page_config(page_title="DealFlow OS", layout="wide")
 # UI
 # =====================================================
 st.title("🚀 DealFlow OS")
-st.caption("VP-Level Investment Decision System")
+st.caption("M&A & Capital Advisory — Deal Execution & Engagement Management")
 
 st.markdown("""
 <style>
@@ -61,12 +61,126 @@ def init_db():
         decision_date TEXT
     )
     """)
+
+    # Engagement / fee columns added post-hoc so existing databases migrate
+    # cleanly instead of erroring on a schema mismatch.
+    existing = [row[1] for row in c.execute("PRAGMA table_info(deals)").fetchall()]
+    for col, coltype in [
+        ("deal_type", "TEXT"),
+        ("retainer", "REAL"),
+        ("success_fee_pct", "REAL"),
+        ("geography", "TEXT"),
+        ("origination", "TEXT"),
+        ("target_close", "TEXT"),
+        ("raise_round", "TEXT"),
+        ("scope", "TEXT"),
+    ]:
+        if col not in existing:
+            c.execute(f"ALTER TABLE deals ADD COLUMN {col} {coltype}")
+
+    # Counterparty CRM: buyers / investors tracked against each engagement.
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS counterparties (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deal_id INTEGER,
+        name TEXT,
+        cp_type TEXT,
+        status TEXT,
+        indicative_value REAL,
+        notes TEXT,
+        updated TEXT
+    )
+    """)
     conn.commit()
 
 init_db()
 
 def load_data():
     return pd.read_sql_query("SELECT * FROM deals ORDER BY id DESC", conn)
+
+def load_counterparties(deal_id):
+    return pd.read_sql_query(
+        "SELECT * FROM counterparties WHERE deal_id=? ORDER BY id DESC",
+        conn, params=(int(deal_id),)
+    )
+
+# =====================================================
+# ENGAGEMENT MODEL
+# =====================================================
+# Engagement types cover the core advisory mandates a boutique / mid-market
+# bank runs. Kept generic so the tool fits any firm, not one in particular.
+DEAL_TYPES = [
+    "Sell-side M&A",
+    "Buy-side M&A",
+    "Capital Raise — Equity",
+    "Capital Raise — Debt",
+    "Restructuring",
+    "Strategic Advisory",
+]
+
+SECTORS = [
+    "Technology / Software",
+    "Healthcare",
+    "Financial Services",
+    "Industrials",
+    "Consumer & Retail",
+    "Business Services",
+    "Energy & Utilities",
+    "Media & Telecom",
+    "Real Estate",
+    "Other",
+]
+
+ORIGINATION = ["Proprietary", "Referral", "Inbound", "Repeat Client"]
+
+RAISE_ROUNDS = ["Seed", "Series A", "Series B", "Series C",
+                "Growth / Late Stage", "Debt", "Other"]
+
+# Currency unit -> factor that converts a typed amount into $M (canonical).
+# Lets the user type figures in whatever unit they like instead of being
+# forced to pre-divide everything into millions.
+UNIT_FACTORS = {
+    "Dollars": 1e-6,
+    "Thousands ($K)": 1e-3,
+    "Millions ($M)": 1.0,
+    "Billions ($B)": 1000.0,
+}
+
+# Outreach funnel a live M&A process runs each buyer/investor through.
+CP_STAGES = ["Identified", "Contacted", "NDA Signed",
+             "IOI Received", "LOI Received", "Passed"]
+
+CP_TYPES = ["Strategic", "Financial (PE)", "Family Office", "Other"]
+
+def _num(v):
+    """Coerce None / NaN / bad values to 0.0 for fee math."""
+    try:
+        v = float(v)
+        return 0.0 if v != v else v  # v != v is True only for NaN
+    except (TypeError, ValueError):
+        return 0.0
+
+def estimated_fees(retainer_k, success_fee_pct, transaction_value_m):
+    """Return (retainer $M, success fee $M, total $M).
+
+    Retainer is entered in $K; success fee is a % of the transaction value
+    (EV, in $M). This is the standard boutique structure: a fixed retainer
+    plus a success fee earned on close.
+    """
+    retainer_m = _num(retainer_k) / 1000.0
+    success_m = _num(success_fee_pct) / 100.0 * _num(transaction_value_m)
+    return retainer_m, success_m, retainer_m + success_m
+
+def fmt_money_m(m):
+    """Format a $M value into a readable $K / $M / $B string."""
+    m = _num(m)
+    if m == 0:
+        return "$0"
+    if abs(m) >= 1000:
+        return f"${m / 1000:.2f}B"
+    if abs(m) >= 1:
+        return f"${m:.1f}M"
+    return f"${m * 1000:.0f}K"
 
 # =====================================================
 # HELPERS
@@ -133,11 +247,13 @@ def priority(score):
         return "🟡 High Priority"
     return "🔵 Watchlist"
 
-stages = ["SOURCED", "SCREENED", "IC", "APPROVED", "CLOSED"]
+# Sell-side M&A engagement lifecycle (pitch through close).
+stages = ["PITCH", "MANDATED", "PREPARATION", "MARKETING",
+          "DILIGENCE", "CLOSING", "CLOSED"]
 
 def next_stage(current):
     if current not in stages:
-        return "SOURCED"
+        return "PITCH"
     idx = stages.index(current)
     return stages[min(idx + 1, len(stages)-1)]
 
@@ -282,17 +398,37 @@ if page == "Dashboard":
     st.header("Executive Overview")
 
     if df.empty:
-        st.info("No deals available.")
+        st.info("No engagements available.")
     else:
+        # Fee-pipeline backlog: sum of estimated total fees across engagements.
+        total_fee = sum(
+            estimated_fees(r.get("retainer"), r.get("success_fee_pct"), r.get("size"))[2]
+            for _, r in df.iterrows()
+        )
+        live = df[df["stage"] != "CLOSED"] if "stage" in df else df
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Active Engagements", len(live))
+        k2.metric("Total Engagements", len(df))
+        k3.metric("Est. Fee Pipeline", f"${total_fee:.1f}M")
+
+        st.divider()
+
         for _, r in df.iterrows():
 
             col1, col2 = st.columns([5,1])
 
+            etype = r["deal_type"] if pd.notna(r.get("deal_type")) else "—"
+            _, _, tot = estimated_fees(
+                r.get("retainer"), r.get("success_fee_pct"), r.get("size")
+            )
+
             with col1:
                 st.write(
                     f"**{r['company']}** | "
-                    f"Score: {r['score']} | "
+                    f"{etype} | "
                     f"Stage: {r['stage']} | "
+                    f"Fee: ${tot:.1f}M | "
                     f"{r['priority']}"
                 )
 
@@ -306,104 +442,124 @@ if page == "Dashboard":
 # =====================================================
 elif page == "Deal Intake":
 
-    st.header("📥 Deal Intake")
+    st.header("📥 New Engagement")
 
-    st.caption("Fields update individually — the deal is only saved when you click **Add Deal**.")
+    st.caption("Fields update individually — the engagement is only saved when you click **Add Engagement**. "
+               "Fields adapt to the engagement type you pick.")
 
-    # Standalone widgets (not wrapped in st.form) so pressing Enter in a field
-    # just commits that field instead of submitting the entire deal.
-    company = st.text_input("Company Name", key="di_company")
+    # ---- Core engagement details (all types) ----
+    company = st.text_input("Client / Company", key="di_company")
 
-    sector = st.selectbox(
-        "Sector",
-        [
-            "Technology",
-            "Healthcare",
-            "Business Services",
-            "Industrials",
-            "Consumer",
-            "Energy",
-            "Financial Services"
-        ],
-        key="di_sector"
+    t1, t2 = st.columns(2)
+    deal_type = t1.selectbox("Engagement Type", DEAL_TYPES, key="di_type")
+    sector = t2.selectbox("Sector", SECTORS, key="di_sector")
+
+    o1, o2, o3 = st.columns(3)
+    geography = o1.text_input("Geography", placeholder="e.g. US, India, Cross-border", key="di_geo")
+    origination = o2.selectbox("Origination", ORIGINATION, key="di_orig")
+    owner = o3.selectbox("Deal Lead", ["Analyst", "VP", "Partner", "MD"], key="di_owner")
+
+    target_close = st.date_input("Target Close (optional)", value=None, key="di_close")
+
+    st.divider()
+
+    # ---- Amount unit selector (no field is silently assumed to be $M) ----
+    st.markdown("**Amounts** — choose the unit you want to type in.")
+    unit = st.selectbox("Amounts entered in", list(UNIT_FACTORS.keys()),
+                        index=2, key="di_unit")
+    factor = UNIT_FACTORS[unit]  # multiply a typed amount to get $M
+
+    # ---- Financial snapshot (all types) ----
+    f1, f2, f3 = st.columns(3)
+    revenue_raw = f1.number_input(f"Revenue ({unit})", min_value=0.0, value=0.0, key="di_revenue")
+    ebitda_raw = f2.number_input(f"EBITDA ({unit})", min_value=0.0, value=0.0, key="di_ebitda")
+    growth = f3.number_input("Revenue Growth (%)", min_value=-50.0, max_value=300.0,
+                             value=0.0, step=1.0, key="di_growth")
+
+    revenue = revenue_raw * factor  # canonical $M
+    ebitda = ebitda_raw * factor    # canonical $M
+    margin = (ebitda / revenue * 100) if revenue else 0.0
+    if revenue:
+        st.caption(f"Revenue {fmt_money_m(revenue)} · EBITDA {fmt_money_m(ebitda)} · "
+                   f"Margin {margin:.1f}%")
+
+    # ---- Conditional fields by engagement type ----
+    size = 0.0            # transaction value ($M) — drives the success fee
+    entry_multiple = 0.0  # expected EV/EBITDA (advisory estimate)
+    raise_round = ""
+    scope = ""
+
+    if deal_type in ("Sell-side M&A", "Buy-side M&A", "Restructuring"):
+        m1, m2 = st.columns(2)
+        tv_raw = m1.number_input(f"Expected Transaction Value ({unit})",
+                                 min_value=0.0, value=0.0, key="di_tv")
+        size = tv_raw * factor
+        entry_multiple = m2.number_input("Expected EV / EBITDA (x)", min_value=0.0,
+                                         max_value=50.0, value=8.0, step=0.5, key="di_mult")
+        if size:
+            st.caption(f"Transaction value: {fmt_money_m(size)}")
+
+    elif deal_type in ("Capital Raise — Equity", "Capital Raise — Debt"):
+        r1, r2 = st.columns(2)
+        raise_round = r1.selectbox("Round", RAISE_ROUNDS, key="di_round")
+        amt_raw = r2.number_input(f"Amount Sought ({unit})", min_value=0.0,
+                                  value=0.0, key="di_amt")
+        size = amt_raw * factor
+        if deal_type == "Capital Raise — Equity":
+            pm_raw = st.number_input(f"Pre-money Valuation ({unit}, optional)",
+                                     min_value=0.0, value=0.0, key="di_premoney")
+            premoney = pm_raw * factor
+            entry_multiple = (premoney / ebitda) if ebitda else 0.0
+        if size:
+            st.caption(f"Amount sought: {fmt_money_m(size)}")
+
+    else:  # Strategic Advisory
+        scope = st.text_area("Scope / Objective", key="di_scope",
+                             placeholder="What is the mandate? (no transaction value)")
+
+    st.divider()
+
+    # ---- Fee economics (all types) ----
+    st.markdown("**Fee Economics**")
+    fee1, fee2 = st.columns(2)
+    retainer = fee1.number_input("Retainer ($K)", min_value=0.0, max_value=100000.0,
+                                 value=50.0, step=5.0, key="di_retainer")
+    success_fee_pct = fee2.number_input("Success Fee (% of transaction value)",
+                                        min_value=0.0, max_value=15.0, value=2.0,
+                                        step=0.25, key="di_successfee")
+
+    notes = st.text_area("Deal Notes", key="di_notes")
+
+    # ---- Live preview ----
+    _, _, tot_fee = estimated_fees(retainer, success_fee_pct, size)
+    score = score_deal(growth, ebitda, revenue, entry_multiple) if (ebitda and revenue) else 0.0
+    preview = (
+        f"Transaction value: **{fmt_money_m(size)}**  |  "
+        f"Est. total fee: **{fmt_money_m(tot_fee)}**"
     )
+    if score:
+        preview += f"  |  Screen score: **{score:.0f}/100** ({priority(score)})"
+    st.info(preview)
 
-    ebitda = st.number_input(
-        "EBITDA ($M)",
-        min_value=1.0,
-        max_value=5000.0,
-        value=25.0,
-        key="di_ebitda"
-    )
-
-    revenue = st.number_input(
-        "Revenue ($M)",
-        min_value=1.0,
-        max_value=50000.0,
-        value=100.0,
-        key="di_revenue"
-    )
-
-    growth = st.slider(
-        "Growth (%)",
-        min_value=-10.0,
-        max_value=100.0,
-        value=12.0,
-        key="di_growth"
-    )
-
-    size = st.number_input(
-        "Enterprise Value ($M)",
-        min_value=10.0,
-        max_value=100000.0,
-        value=250.0,
-        key="di_size"
-    )
-
-    entry_multiple = st.slider(
-        "Entry Multiple (x)",
-        min_value=1.0,
-        max_value=25.0,
-        value=8.0,
-        key="di_entry"
-    )
-
-    ownership = st.slider(
-        "Ownership (%)",
-        min_value=10,
-        max_value=100,
-        value=100,
-        key="di_ownership"
-    )
-
-    owner = st.selectbox(
-        "Deal Owner",
-        ["Analyst", "VP", "Partner"],
-        key="di_owner"
-    )
-
-    notes = st.text_area("Investment Notes", key="di_notes")
-
-    # Live preview so the user sees the score before committing.
-    preview = score_deal(growth, ebitda, revenue, entry_multiple)
-    st.info(f"Projected score: **{preview}/100** — {priority(preview)}")
-
-    if st.button("Add Deal", type="primary"):
+    if st.button("Add Engagement", type="primary"):
 
         if company.strip() == "":
-            st.error("Company name required.")
+            st.error("Client / company name required.")
             st.stop()
 
         score = score_deal(growth, ebitda, revenue, entry_multiple)
+        close_str = str(target_close) if target_close else ""
 
         c.execute("""
         INSERT INTO deals (
             date, company, sector, ebitda, revenue, growth,
             size, entry_multiple, ownership, score,
             priority, stage, owner, notes,
-            decision, decision_reason, decision_date
+            decision, decision_reason, decision_date,
+            deal_type, retainer, success_fee_pct,
+            geography, origination, target_close, raise_round, scope
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             str(datetime.date.today()),
             company.strip(),
@@ -413,28 +569,37 @@ elif page == "Deal Intake":
             growth,
             size,
             entry_multiple,
-            ownership,
+            100,  # ownership retained for the returns model; not an intake field
             score,
             priority(score),
-            "SOURCED",
+            "PITCH",
             owner,
             notes,
             "Pending",
             "",
-            ""
+            "",
+            deal_type,
+            retainer,
+            success_fee_pct,
+            geography,
+            origination,
+            close_str,
+            raise_round,
+            scope
         ))
 
         conn.commit()
 
         # Clear the inputs by dropping their widget state, then rerun.
         for k in [
-            "di_company", "di_sector", "di_ebitda", "di_revenue",
-            "di_growth", "di_size", "di_entry", "di_ownership",
-            "di_owner", "di_notes"
+            "di_company", "di_type", "di_sector", "di_geo", "di_orig", "di_owner",
+            "di_close", "di_unit", "di_revenue", "di_ebitda", "di_growth",
+            "di_tv", "di_mult", "di_round", "di_amt", "di_premoney", "di_scope",
+            "di_retainer", "di_successfee", "di_notes"
         ]:
             st.session_state.pop(k, None)
 
-        st.success("Deal added successfully.")
+        st.success("Engagement added successfully.")
         st.rerun()
 
 # =====================================================
@@ -445,15 +610,18 @@ elif page == "Pipeline":
     st.header("Pipeline")
 
     if df.empty:
-        st.info("No deals in pipeline.")
+        st.info("No engagements in pipeline.")
     else:
         for _, r in df.iterrows():
 
             col1, col2 = st.columns([5,1])
 
+            etype = r["deal_type"] if pd.notna(r.get("deal_type")) else "—"
+
             with col1:
                 st.write(
                     f"**{r['company']}** | "
+                    f"{etype} | "
                     f"Stage: {r['stage']} | "
                     f"Score: {r['score']}"
                 )
@@ -496,15 +664,138 @@ elif page == "Deal Workspace":
 
     st.subheader("📊 Financial Overview")
 
+    margin = (_num(deal["ebitda"]) / _num(deal["revenue"]) * 100) if _num(deal["revenue"]) else 0.0
+    mult = _num(deal["entry_multiple"])
     st.write({
         "Sector": deal["sector"],
-        "EBITDA ($M)": deal["ebitda"],
-        "Revenue ($M)": deal["revenue"],
-        "Growth (%)": deal["growth"],
-        "EV ($M)": deal["size"],
-        "Entry Multiple": deal["entry_multiple"],
-        "Ownership (%)": deal["ownership"]
+        "Revenue": fmt_money_m(deal["revenue"]),
+        "EBITDA": fmt_money_m(deal["ebitda"]),
+        "EBITDA margin": f"{margin:.1f}%",
+        "Revenue growth": f"{_num(deal['growth']):.1f}%",
+        "Transaction value": fmt_money_m(deal["size"]),
+        "Expected EV/EBITDA": f"{mult:.1f}x" if mult else "—",
     })
+
+    st.divider()
+
+    # -------------------------------------------------
+    # ENGAGEMENT & FEE ECONOMICS
+    # -------------------------------------------------
+    st.subheader("🏦 Engagement & Fee Economics")
+
+    def _field(v):
+        return v if (pd.notna(v) and str(v).strip()) else "—"
+
+    etype = _field(deal["deal_type"])
+    ret_k = _num(deal["retainer"])
+    sf_pct = _num(deal["success_fee_pct"])
+    ret_m, succ_m, tot_m = estimated_fees(ret_k, sf_pct, deal["size"])
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Engagement", etype)
+    e2.metric("Transaction Value", fmt_money_m(deal["size"]))
+    e3.metric("Success Fee", f"{sf_pct:.2f}%")
+    e4.metric("Est. Total Fee", fmt_money_m(tot_m))
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Geography", _field(deal["geography"]))
+    d2.metric("Origination", _field(deal["origination"]))
+    d3.metric("Target Close", _field(deal["target_close"]))
+    d4.metric("Round", _field(deal["raise_round"]))
+
+    st.caption(
+        f"Success fee ≈ {sf_pct:.2f}% × {fmt_money_m(deal['size'])} = "
+        f"{fmt_money_m(succ_m)}, plus {fmt_money_m(ret_m)} retainer (${ret_k:,.0f}K)."
+    )
+    if _field(deal["scope"]) != "—":
+        st.caption(f"**Scope:** {deal['scope']}")
+
+    st.divider()
+
+    # -------------------------------------------------
+    # BUYER / INVESTOR OUTREACH (CRM)
+    # -------------------------------------------------
+    st.subheader("🤝 Buyer / Investor Outreach")
+    st.caption("Track each counterparty through the outreach funnel: "
+               "Identified → Contacted → NDA → IOI → LOI.")
+
+    cps = load_counterparties(deal["id"])
+
+    fcols = st.columns(len(CP_STAGES))
+    for i, sname in enumerate(CP_STAGES):
+        cnt = int((cps["status"] == sname).sum()) if not cps.empty else 0
+        fcols[i].metric(sname, cnt)
+
+    if cps.empty:
+        st.info("No buyers / investors added yet.")
+    else:
+        st.dataframe(
+            cps[["name", "cp_type", "status", "indicative_value", "notes", "updated"]]
+            .rename(columns={
+                "name": "Counterparty",
+                "cp_type": "Type",
+                "status": "Stage",
+                "indicative_value": "Indicative ($M)",
+                "notes": "Notes",
+                "updated": "Updated",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("➕ Add buyer / investor"):
+        n_name = st.text_input("Name", key="cp_name")
+        n_type = st.selectbox("Type", CP_TYPES, key="cp_ctype")
+        n_status = st.selectbox("Stage", CP_STAGES, key="cp_status")
+        n_val = st.number_input(
+            "Indicative value ($M)", min_value=0.0, value=0.0, step=5.0, key="cp_val"
+        )
+        n_notes = st.text_input("Notes", key="cp_notes")
+
+        if st.button("Add to outreach list"):
+            if n_name.strip() == "":
+                st.error("Name required.")
+            else:
+                c.execute("""
+                INSERT INTO counterparties
+                    (deal_id, name, cp_type, status, indicative_value, notes, updated)
+                VALUES (?,?,?,?,?,?,?)
+                """, (
+                    int(deal["id"]), n_name.strip(), n_type, n_status,
+                    n_val, n_notes, str(datetime.date.today())
+                ))
+                conn.commit()
+                for k in ["cp_name", "cp_ctype", "cp_status", "cp_val", "cp_notes"]:
+                    st.session_state.pop(k, None)
+                st.success(f"Added {n_name.strip()}.")
+                st.rerun()
+
+    if not cps.empty:
+        with st.expander("✏️ Update / remove a counterparty"):
+            names = cps["name"].tolist()
+            sel = st.selectbox("Counterparty", names, key="cp_edit_sel")
+            sel_row = cps[cps["name"] == sel].iloc[0]
+            cur_status = sel_row["status"] if sel_row["status"] in CP_STAGES else CP_STAGES[0]
+            new_status = st.selectbox(
+                "New stage", CP_STAGES,
+                index=CP_STAGES.index(cur_status), key="cp_edit_status"
+            )
+            u1, u2 = st.columns(2)
+            if u1.button("Update stage"):
+                c.execute(
+                    "UPDATE counterparties SET status=?, updated=? WHERE id=?",
+                    (new_status, str(datetime.date.today()), int(sel_row["id"]))
+                )
+                conn.commit()
+                st.success("Stage updated.")
+                st.rerun()
+            if u2.button("Remove"):
+                c.execute(
+                    "DELETE FROM counterparties WHERE id=?", (int(sel_row["id"]),)
+                )
+                conn.commit()
+                st.success("Removed.")
+                st.rerun()
 
     st.divider()
 
@@ -516,9 +807,14 @@ elif page == "Deal Workspace":
 
     ra1, ra2, ra3 = st.columns(3)
     hold_years = ra1.slider("Hold period (yrs)", 1, 10, 5, key="ra_hold")
+    # Default the exit multiple to the expected EV/EBITDA, clamped into the
+    # slider's range (raises/advisory may have no multiple, so fall back to 8x).
+    em_default = float(_num(deal["entry_multiple"]))
+    if not (1.0 <= em_default <= 25.0):
+        em_default = 8.0
     exit_multiple = ra2.slider(
         "Exit multiple (x)", 1.0, 25.0,
-        float(deal["entry_multiple"]), step=0.5, key="ra_exit"
+        em_default, step=0.5, key="ra_exit"
     )
     leverage_pct = ra3.slider(
         "Leverage (debt % of EV)", 0, 80, 50, key="ra_lev"
@@ -562,7 +858,7 @@ elif page == "Deal Workspace":
     st.info(f"Current Process Stage: {deal['stage']}")
 
     if permissions[role]["can_promote"]:
-        if st.button("➡ Promote Stage"):
+        if st.button("➡ Advance Engagement Stage"):
 
             new_stage = next_stage(deal["stage"])
 
